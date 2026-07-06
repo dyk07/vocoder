@@ -1,0 +1,14 @@
+numpy>=1.22.0
+pandas>=1.4.0
+librosa>=0.10.0
+soundfile>=0.12.1
+scipy>=1.8.0
+auraloss>=0.4.0
+pymcd>=0.2.1
+praat-parselmouth>=0.4.3
+torch>=2.0.0
+torchaudio>=2.0.0
+
+
+# Note: pesq should be installed via conda-forge if compiling issues occur:
+# conda install -c conda-forge pesq
