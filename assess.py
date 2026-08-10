@@ -1,48 +1,50 @@
-model_name = "bigvgan_24khz_100band"
-
+import functools
 import os
-from os import path
-import librosa
-import soundfile as sf
+import traceback
 import numpy as np
 import pandas as pd
 from pesq import pesq
-from scipy.io import wavfile
-from sympy import deg
+from scipy.spatial.distance import euclidean
 import torch
 import torchaudio
-import torchaudio.functional as FA
+from fastdtw import fastdtw
 import auraloss
 
-# 1. Exact MCD implementation library from paper
-from pymcd.mcd import Calculate_MCD
+from evaluate import load_wav, readmgc
+from cargan.evaluate.objective.metrics import Pitch
+from cargan.preprocess.pitch import from_audio
 
-# 2. Exact CARGAN metric dependency (Praat engine)
-import parselmouth as pm
+# General configuration
+model_name = "bigvgan_base_24khz_100band"
+index_files = ["dev-clean.txt", "dev-other.txt"]
+libri_tts_dir = "LibriTTS"
+synthesized_dir = f"synthesized_{model_name}" 
+output_csv = f"evaluation_scores_{model_name}.csv"
+target_sr = 16000  # PESQ WB requirements
+SR_TARGET = 24000  # Native vocoder sample rate
+MAX_WAV_VALUE = 32768.0
 
 # Global device configuration
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 UTMOS_PREDICTOR = None
-MCD_TOOL = None
 
 def get_utmos():
     """Lazy-load UTMOS predictor."""
     global UTMOS_PREDICTOR
     if UTMOS_PREDICTOR is None:
         print("Loading UTMOS model onto device...")
-        UTMOS_PREDICTOR = torch.hub.load("tarepan/SpeechMOS", "utmos22_strong", trust_repo=True)
+        # CRITICAL: Disable online checking to prevent hanging on GitHub's connection check
+        UTMOS_PREDICTOR = torch.hub.load(
+            "tarepan/SpeechMOS", 
+            "utmos22_strong", 
+            trust_repo=True, 
+            force_reload=False,
+            skip_validation=True
+        )
         UTMOS_PREDICTOR = UTMOS_PREDICTOR.to(device)
         UTMOS_PREDICTOR.eval()
     return UTMOS_PREDICTOR
 
-def get_mcd_tool():
-    """Lazy-load python-MCD tool matching official repository settings."""
-    global MCD_TOOL
-    if MCD_TOOL is None:
-        # CRITICAL FIX: Changing from "plain" to "dtw" to prevent trailing 
-        # zero-padding mismatch distortion metrics.
-        MCD_TOOL = Calculate_MCD(MCD_mode="dtw")
-    return MCD_TOOL
 
 def utmos_score(audio, sr):
     """Calculate UTMOS score utilizing device acceleration."""
@@ -51,6 +53,7 @@ def utmos_score(audio, sr):
         wav_tensor = torch.from_numpy(audio).float().unsqueeze(0).to(device)
         score = predictor(wav_tensor, sr)
     return score.mean().item()
+
 
 def parse_index_file(index_path):
     audio_bases = []
@@ -66,191 +69,149 @@ def parse_index_file(index_path):
             audio_bases.append(base_path)
     return audio_bases
 
-def calculate_mstft(ref_wav, test_wav):
-    """Calculates Multi-Resolution STFT Distance via Auraloss."""
-    min_len = min(len(ref_wav), len(test_wav))
-    ref_wav = ref_wav[:min_len]
-    test_wav = test_wav[:min_len]
 
-    ref_tensor = torch.tensor(ref_wav).unsqueeze(0).unsqueeze(0).float().to(device)
-    test_tensor = torch.tensor(test_wav).unsqueeze(0).unsqueeze(0).float().to(device)
-    
-    mstft_loss = auraloss.freq.MultiResolutionSTFTLoss().to(device)
-    loss = mstft_loss(test_tensor, ref_tensor)
-    return loss.item()
+def evaluate(gt_path, synth_path):
+    """Perform objective evaluation for a single audio file pair"""
+    gpu = 0 if torch.cuda.is_available() else None
+    eval_device = torch.device('cpu' if gpu is None else f'cuda:{gpu}')
+    torch.cuda.empty_cache()
 
-def calculate_cargan_metrics(ref_path, test_path):
-    """
-    Computes Periodicity RMSE and V/UV F1 score matching the official 
-    CARGAN evaluation framework.
-    """
-    try:
-        snd_ref = pm.Sound(ref_path)
-        snd_test = pm.Sound(test_path)
-        
-        # Praat returns harmonicity in dB. Convert it to a bounded periodicity
-        # estimate before computing RMSE so the scale matches the paper.
-        harm_ref_db = np.asarray(snd_ref.to_harmonicity().as_array()).squeeze()
-        harm_test_db = np.asarray(snd_test.to_harmonicity().as_array()).squeeze()
-        
-        # Replace non-finite and extreme masking values before conversion.
-        harm_ref_db = np.nan_to_num(harm_ref_db, nan=-200.0, neginf=-200.0, posinf=200.0)
-        harm_test_db = np.nan_to_num(harm_test_db, nan=-200.0, neginf=-200.0, posinf=200.0)
-        harm_ref_db[harm_ref_db < -200] = -200
-        harm_test_db[harm_test_db < -200] = -200
-        
-        # Map harmonicity dB to a 0-1 periodicity estimate.
-        harm_ref_periodicity = 1.0 / (1.0 + 10.0 ** (-harm_ref_db / 10.0))
-        harm_test_periodicity = 1.0 / (1.0 + 10.0 ** (-harm_test_db / 10.0))
-        
-        # Make lengths match via truncating
-        min_len = min(len(harm_ref_periodicity), len(harm_test_periodicity))
-        harm_ref_periodicity = harm_ref_periodicity[:min_len]
-        harm_test_periodicity = harm_test_periodicity[:min_len]
-        
-        periodicity_rmse = np.sqrt(np.mean((harm_ref_periodicity - harm_test_periodicity) ** 2))
-        
-        # Explicit extraction settings matching standard vocoder baselines.
-        pitch_ref = snd_ref.to_pitch_ac(time_step=0.01, pitch_floor=75.0, pitch_ceiling=600.0)
-        pitch_test = snd_test.to_pitch_ac(time_step=0.01, pitch_floor=75.0, pitch_ceiling=600.0)
-        
-        f0_ref = pitch_ref.selected_array['frequency']
-        f0_test = pitch_test.selected_array['frequency']
-        
-        min_f0_len = min(len(f0_ref), len(f0_test))
-        f0_ref = f0_ref[:min_f0_len]
-        f0_test = f0_test[:min_f0_len]
-        
-        # Determine Voiced (1) vs Unvoiced (0) bitmasks
-        v_ref = (f0_ref > 0).astype(int)
-        v_test = (f0_test > 0).astype(int)
-        
-        # Calculate F1 Score Components natively
-        tp = np.sum((v_ref == 1) & (v_test == 1))
-        fp = np.sum((v_ref == 0) & (v_test == 1))
-        fn = np.sum((v_ref == 1) & (v_test == 0))
-        
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        vuv_f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-        
-        return float(periodicity_rmse), float(vuv_f1)
-        
-    except Exception as e:
-        print(f"CARGAN Metric Math Error: {e}")
-        return 0.1, 0.95
+    resampler_16k = torchaudio.transforms.Resample(SR_TARGET, 16000).to(eval_device)
+    resampler_22k = torchaudio.transforms.Resample(SR_TARGET, 22050).to(eval_device)
+
+    # Modules for evaluation metrics
+    loss_mrstft = auraloss.freq.MultiResolutionSTFTLoss().to(eval_device)
+    batch_metrics_periodicity = Pitch()
+    periodicity_fn = functools.partial(from_audio, gpu=gpu)
+
+    with torch.no_grad():
+        # Load individual files
+        y = load_wav(gt_path).to(eval_device)
+        y_g_hat = load_wav(synth_path).to(eval_device)
+
+        min_len = min(y.shape[-1], y_g_hat.shape[-1])
+        y = y[:, :min_len]
+        y_g_hat = y_g_hat[:, :min_len]
+
+        # Resample
+        y_16k = resampler_16k(y)
+        y_g_hat_16k = resampler_16k(y_g_hat)
+
+        y_22k = resampler_22k(y)
+        y_g_hat_22k = resampler_22k(y_g_hat)
+
+        # MRSTFT calculation
+        mrstft_val = loss_mrstft(y_g_hat.unsqueeze(1), y.unsqueeze(1)).item()
+
+        # PESQ calculation
+        y_int_16k = (y_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
+        y_g_hat_int_16k = (y_g_hat_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
+        pesq_val = pesq(16000, y_int_16k, y_g_hat_int_16k, 'wb')
+
+        # MCD calculation
+        y_double_22k = (y_22k[0] * MAX_WAV_VALUE).double().cpu().numpy()
+        y_g_hat_double_22k = (y_g_hat_22k[0] * MAX_WAV_VALUE).double().cpu().numpy()
+
+        y_mgc = readmgc(y_double_22k)
+        y_g_hat_mgc = readmgc(y_g_hat_double_22k)
+
+        _, path_dtw = fastdtw(y_mgc, y_g_hat_mgc, dist=euclidean)
+
+        y_path = list(map(lambda l: l[0], path_dtw))
+        y_g_hat_path = list(map(lambda l: l[1], path_dtw))
+        y_mgc = y_mgc[y_path]
+        y_g_hat_mgc = y_g_hat_mgc[y_g_hat_path]
+
+        frames = y_mgc.shape[0]
+
+        z = y_mgc - y_g_hat_mgc
+        s = np.sqrt((z * z).sum(-1)).sum()
+        mcd_val = 10.0 / np.log(10.0) * np.sqrt(2.0) * float(s) / float(frames)
+
+        # Periodicity calculation
+        true_pitch, true_periodicity = periodicity_fn(y_22k)
+        pred_pitch, pred_periodicity = periodicity_fn(y_g_hat_22k)
+        batch_metrics_periodicity.update(true_pitch, true_periodicity, pred_pitch, pred_periodicity)
+
+    results = batch_metrics_periodicity()
+
+    return {
+        'M-STFT': mrstft_val,
+        'PESQ': pesq_val,
+        'MCD': mcd_val,
+        'Periodicity': results['periodicity'],
+        'V/UV F1': results['f1'],
+    }
+
 
 def main():
-    index_files = ["dev-clean.txt", "dev-other.txt"]
-    libri_tts_dir = "LibriTTS" 
-    synthesized_dir = f"synthesized_{model_name}" 
-    output_csv = f"evaluation_scores_{model_name}.csv"
-    target_sr = 16000 # PESQ WB requirements
-    
     audio_bases = []
     for index_file in index_files:
         audio_bases.extend(parse_index_file(index_file))
-    results = []
-
-    # utmos_model = get_utmos()
-    # mcd_tool = get_mcd_tool()
     
+    results = []
     pesq_scores_sum = 0
     mstft_scores_sum = 0
     mcd_scores_sum = 0
-    periodicity_rmse_sum = 0
+    periodicity_sum = 0
     vuv_f1_sum = 0
     utmos_scores_sum = 0
     valid_count = 0
+    pesq_valid_count = 0
 
-    for base in audio_bases:
+    for idx, base in enumerate(audio_bases):
         ref_path = os.path.join(libri_tts_dir, f"{base}.wav")
         test_path = os.path.join(synthesized_dir, f"{base}.wav")
         
         if not os.path.exists(ref_path) or not os.path.exists(test_path):
             continue
 
+        print(f"\n[{idx + 1}/{len(audio_bases)}] Processing: {base}")
+
         try:
-            # ref_wav, sr_ref = librosa.load(ref_path, sr=target_sr)
-            # test_wav, sr_test = librosa.load(test_path, sr=target_sr)
-            # min_len = min(len(ref_wav), len(test_wav))
-            
-            # 1. PESQ (Wideband - python-pesq)
-            try:
-                # Load audio files cleanly as float32 numpy arrays via soundfile
-                ref_np, ref_sr = sf.read(ref_path, dtype='float32')
-                deg_np, deg_sr = sf.read(test_path, dtype='float32')
+            # Main evaluations
+            results_dict = evaluate(ref_path, test_path)
+            results_dict["Audio_ID"] = base
 
-                # Convert arrays to PyTorch tensors and ensure shape is [channels, time]
-                if ref_np.ndim == 1:
-                    ref_wav = torch.from_numpy(ref_np).unsqueeze(0)
-                else:
-                    ref_wav = torch.from_numpy(ref_np).T
+            # UTMOS calculation
+            print("  --> Calculating UTMOS...")
+            synth_wav = load_wav(test_path).squeeze().numpy()
+            utmos_sc = utmos_score(synth_wav, SR_TARGET)
+            results_dict["UTMOS"] = utmos_sc
 
-                if deg_np.ndim == 1:
-                    deg_wav = torch.from_numpy(deg_np).unsqueeze(0)
-                else:
-                    deg_wav = torch.from_numpy(deg_np).T
-                
-                # High-fidelity resample both to 16kHz using PyTorch's native sinc interpolation
-                ref_16k = FA.resample(ref_wav, orig_freq=ref_sr, new_freq=16000)
-                deg_16k = FA.resample(deg_wav, orig_freq=deg_sr, new_freq=16000)
-                
-                ref_np = ref_16k.squeeze().numpy()
-                deg_np = deg_16k.squeeze().numpy()
+            results.append(results_dict)
+            print("[SUCCESS]")
+            
+            valid_count += 1
+            if results_dict.get("PESQ") is not None:
+                pesq_scores_sum += results_dict["PESQ"]
+                pesq_valid_count += 1
+            
+            mstft_scores_sum += results_dict["M-STFT"]
+            mcd_scores_sum += results_dict["MCD"]
+            periodicity_sum += results_dict["Periodicity"]
+            vuv_f1_sum += results_dict["V/UV F1"]
+            utmos_scores_sum += results_dict["UTMOS"]
 
-                pesq_score = pesq(16000, ref_np, deg_np, 'wb')
-                
-            except Exception as e:
-                pesq_score = None 
-                print(f"Error calculating PESQ for {base}: {e}")
-
-            # # 2. M-STFT (Auraloss)
-            # mstft_score = calculate_mstft(ref_wav, test_wav)
-            
-            # # 3. MCD (Official python-MCD bindings passing filepaths)
-            # mcd_score = mcd_tool.calculate_mcd(ref_path, test_path)
-            
-            # # 4 & 5. Periodicity & V/UV F1 (CARGAN/Praat Framework)
-            # periodicity, vuv_f1 = calculate_cargan_metrics(ref_path, test_path)
-            
-            # # 6. UTMOS 
-            # utmos_sc = utmos_score(test_wav, target_sr)
-            
-            results.append({
-                "Audio_ID": base,
-                "PESQ": pesq_score,
-                # "M-STFT": mstft_score,
-                # "MCD": mcd_score,
-                # "Periodicity_RMSE": periodicity,
-                # "V_UV_F1": vuv_f1,
-                # "UTMOS": utmos_sc
-            })
-            
         except Exception as e:
             print(f"Error processing {base}: {e}")
-        
-        else:
-            valid_count += 1
-            pesq_scores_sum += pesq_score if pesq_score is not None else 0
-            # mstft_scores_sum += mstft_score
-            # mcd_scores_sum += mcd_score
-            # periodicity_rmse_sum += periodicity
-            # vuv_f1_sum += vuv_f1
-            # utmos_scores_sum += utmos_sc
- 
+            traceback.print_exc()
+
+    # Append average metrics summary row
     results.append({
         "Audio_ID": "Average",
-        "PESQ": pesq_scores_sum / valid_count if valid_count > 0 else None,
+        "PESQ": pesq_scores_sum / pesq_valid_count if pesq_valid_count > 0 else None,
         "M-STFT": mstft_scores_sum / valid_count if valid_count > 0 else None,
         "MCD": mcd_scores_sum / valid_count if valid_count > 0 else None,
-        "Periodicity_RMSE": periodicity_rmse_sum / valid_count if valid_count > 0 else None,
-        "V_UV_F1": vuv_f1_sum / valid_count if valid_count > 0 else None,
+        "Periodicity": periodicity_sum / valid_count if valid_count > 0 else None,
+        "V/UV F1": vuv_f1_sum / valid_count if valid_count > 0 else None,
         "UTMOS": utmos_scores_sum / valid_count if valid_count > 0 else None
     })
+
     df = pd.DataFrame(results)
     df.to_csv(output_csv, index=False)
     print(f"\nEvaluation complete. Saved to {output_csv}")
+
 
 if __name__ == "__main__":
     main()
