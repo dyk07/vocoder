@@ -20,3 +20,7 @@ https://www.openslr.org/60/
 这个月搞定 客观分打分工具和主观分打分平台，确保完全正确，客观分弄完了之后我告诉你主观测评平台要怎么写 是一个python GUI程序
 争取一个月搞定
 下个月你就要去运行各个基线模型测出分数然后制表了
+
+## 20260812
+already aligned metrics: MCD, M-STFT, pesq, V/UV F1
+remaining: Periodicity, Pitch, UTMOS, VISQOL

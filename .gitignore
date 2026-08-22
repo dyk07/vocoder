@@ -1,5 +1,8 @@
 /LibriTTS/
 /synthesized_*/
+.vscode
+/visqol
+/results
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
