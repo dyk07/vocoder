@@ -6,28 +6,21 @@ import pandas as pd
 import auraloss
 import pysptk
 import librosa
-import functools
 
 import torch
-from torch.masked import normalize
-from torch.masked import normalize
 import torchaudio
 import torchcrepe
 
 from pesq import pesq
 from fastdtw import fastdtw
-
 from scipy.spatial.distance import euclidean
 from scipy.io.wavfile import read
-
-from cargan.evaluate.objective.metrics import Pitch
-from cargan.preprocess.pitch import from_audio
 
 # from visqol import visqol_lib_py
 # from visqol.pb2 import visqol_config_pb2
 
 # General configuration
-model_name = "periodwave_midpoint_16_0.667"
+model_name = "vocos_mel_24khz"  # Change this to the model you want to evaluate
 index_files = ["dev-clean.txt", "dev-other.txt"]
 libri_tts_dir = "LibriTTS"
 synthesized_dir = f"synthesized_{model_name}" 
@@ -35,6 +28,7 @@ output_csv = f"evaluation_scores_{model_name}.csv"
 target_sr = 16000  # PESQ WB & CREPE requirement
 SR_TARGET = 24000  # Native vocoder sample rate
 MAX_WAV_VALUE = 32768.0
+GT_CLAMPING = False  # Enable/Disable amplitude clamping for ground truth audio
 
 # Global device configuration
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -242,6 +236,21 @@ def evaluate(gt_path, synth_path):
         y = load_wav(gt_path).to(eval_device)
         y_g_hat = load_wav(synth_path).to(eval_device)
 
+        # ==============================================================================
+        # Added Amplitude Capping and Length Truncation
+        # ==============================================================================
+        # 1. Normalize Ground Truth to exactly 0.95 peak
+        if GT_CLAMPING == True:
+            y_max = torch.abs(y).max()
+            if y_max > 0:
+                y = (y / y_max) * 0.95
+  
+            # 3. Cap Synthesized Audio at 0.95 peak (Directly affects UTMOS)
+            if torch.abs(y_g_hat).max() >= 0.95:
+                y_g_hat = (y_g_hat / torch.abs(y_g_hat).max()) * 0.95
+            # ==============================================================================
+
+        
         min_len = min(y.shape[-1], y_g_hat.shape[-1])
         y = y[:, :min_len]
         y_g_hat = y_g_hat[:, :min_len]
@@ -385,7 +394,7 @@ def main():
             vuv_f1_sum += results_dict["V/UV F1"]
             utmos_scores_sum += results_dict["UTMOS"]
 
-        except Exception as e:
+        except Exception as e:  
             print(f"Error processing {base}: {e}")
             traceback.print_exc()
 
