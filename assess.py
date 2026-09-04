@@ -1,5 +1,7 @@
 import functools
 import os
+import sys
+import types
 import traceback
 import numpy as np
 import pandas as pd
@@ -16,15 +18,26 @@ from fastdtw import fastdtw
 from scipy.spatial.distance import euclidean
 from scipy.io.wavfile import read
 
-# from visqol import visqol_lib_py
-# from visqol.pb2 import visqol_config_pb2
+from visqol import visqol_lib_py
+from visqol.pb2 import similarity_result_pb2
+from visqol.pb2 import visqol_config_pb2
+
+# The native binding imports this generated module using the repository's
+# source-tree name, while the installed package exposes it under visqol.pb2.
+src_module = types.ModuleType("src")
+proto_module = types.ModuleType("src.proto")
+src_module.proto = proto_module
+proto_module.similarity_result_pb2 = similarity_result_pb2
+sys.modules.setdefault("src", src_module)
+sys.modules.setdefault("src.proto", proto_module)
+sys.modules.setdefault("src.proto.similarity_result_pb2", similarity_result_pb2)
 
 # General configuration
-model_name = "vocos_mel_24khz"  # Change this to the model you want to evaluate
+model_name = "flow2gan_4step"  # Change this to the model you want to evaluate
 index_files = ["dev-clean.txt", "dev-other.txt"]
 libri_tts_dir = "LibriTTS"
-synthesized_dir = f"synthesized_{model_name}" 
-output_csv = f"evaluation_scores_{model_name}.csv"
+synthesized_dir = os.path.join("synthesized", f"synthesized_{model_name}")
+output_csv = os.path.join("results", f"evaluation_scores_{model_name}.csv")
 target_sr = 16000  # PESQ WB & CREPE requirement
 SR_TARGET = 24000  # Native vocoder sample rate
 MAX_WAV_VALUE = 32768.0
@@ -146,7 +159,7 @@ def visqol(
     config.audio.sample_rate = target_sr
     config.options.svr_model_path = os.path.join(
         os.path.dirname(visqol_lib_py.__file__), "model", svr_model_path
-    )
+    ).encode("utf-8")
 
     api = visqol_lib_py.VisqolApi()
     api.Create(config)
@@ -343,6 +356,8 @@ def evaluate(gt_path, synth_path):
 
 
 def main():
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    
     audio_bases = []
     for index_file in index_files:
         audio_bases.extend(parse_index_file(index_file))

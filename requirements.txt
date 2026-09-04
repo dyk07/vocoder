@@ -16,4 +16,3 @@ pesq>=0.0.4
 fastdtw>=0.3.4
 
 # visqol (not available via pip; requires manual build from Google's repository)
-# cargan (not needed for the current implementation)
